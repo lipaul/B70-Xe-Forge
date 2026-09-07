@@ -35,14 +35,18 @@ def _setup_dspy(config: Config) -> None:
     litellm.client_session = httpx.Client()
     litellm.aclient_session = httpx.AsyncClient()
     litellm.ssl_verify = True
+    _extra = {}
+    if os.environ.get("LLM_DISABLE_THINKING", "").lower() in ("1", "true", "yes"):
+        _extra["enable_thinking"] = False
     lm = dspy.LM(
         model=config.llm.model,
         api_base=config.llm.api_base,
-        model_type="responses",
+        model_type=os.environ.get("LLM_MODEL_TYPE", "responses"),
         api_key=config.llm.api_key or "",
         temperature=config.llm.temperature,
         max_tokens=config.llm.max_tokens,
         cache=False,
+        **({"extra_body": _extra} if _extra else {}),
     )
     dspy.configure(lm=lm, warn_on_type_mismatch=False)
 

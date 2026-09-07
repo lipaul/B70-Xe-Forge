@@ -3,7 +3,13 @@ from collections.abc import Callable
 from typing import Any
 
 import dspy
-from dspy.predict.react import _fmt_exc
+
+try:
+    from dspy.predict.react import _fmt_exc
+except ImportError:  # dspy >=3.3 removed this private helper
+
+    def _fmt_exc(exc: BaseException) -> str:
+        return f"{type(exc).__name__}: {exc}"
 
 try:
     from litellm.exceptions import ContextWindowExceededError
