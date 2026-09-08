@@ -5,14 +5,15 @@ Manual runner for the Intel SYCL (DPC++) NATTEN kernels in examples/natten/.
 Requires real Intel GPU hardware (torch.xpu.is_available()). Not a pytest suite.
 
 Usage:
-    python runners/test_natten_sycl.py            # correctness + benchmark sweep
+    python runners/test_natten_sycl.py            # correctness + naive-vs-opt sweep
     python runners/test_natten_sycl.py --quick    # smaller shapes only
     python runners/test_natten_sycl.py --dim 1d   # only 1D
     python runners/test_natten_sycl.py --dim 2d   # only 2D
 
-Each kernel is compiled with icpx (AOT -device from AIBENCH_SYCL_TARGET) and run
-via SyclExecutor.execute_raw, which parses "Disposition:" (correctness) and
-"Performance: ... TFlop/s ... ms" (benchmark) from the binary's stdout.
+Kernels are compiled with icpx (AOT -device from AIBENCH_SYCL_TARGET) and run via
+SyclExecutor.execute_raw, which parses "Disposition:" (correctness) and
+"Performance: ... TFlop/s ... ms" (benchmark). The memory-roofline ceiling for
+each shape is computed here (Arc Pro B70: 608 GB/s) and reported as % of roof.
 """
 
 import argparse
@@ -25,23 +26,25 @@ from xe_forge.core.sycl_executor import KernelType, SyclExecutor
 
 _here = Path(__file__).resolve().parent
 _NATTEN_DIR = _here.parent / "examples" / "natten"
-_KERNEL_1D = str(_NATTEN_DIR / "natten1d_sycl.cpp")
-_KERNEL_2D = str(_NATTEN_DIR / "natten2d_sycl.cpp")
+_K1D = str(_NATTEN_DIR / "natten1d_sycl.cpp")  # naive
+_K1D_OPT = str(_NATTEN_DIR / "natten1d_opt.cpp")  # D-split + SLM
+_K2D = str(_NATTEN_DIR / "natten2d_sycl.cpp")
+
+PEAK_BW_GBPS = 608.0  # Arc Pro B70 (matches scripts/roofline.py preset)
 
 
-def _run_one(ex: SyclExecutor, kernel: str, name: str, args: dict) -> bool:
-    res = ex.execute_raw(kernel_path=kernel, output_name=name, args=args, timeout=300)
-    # verify=0 -> output_correct is None (not checked); success alone is enough.
-    ok = bool(res.success and res.output_correct is not False)
-    tf = f"{res.tflops:.4f}" if res.tflops is not None else "--"
-    ms = f"{res.execution_time_ms:.4f}" if res.execution_time_ms is not None else "--"
-    print(
-        f"  [{'PASS' if ok else 'FAIL'}] {name:<9} "
-        f"tflops={tf:<8} ms={ms:<8} correct={res.output_correct}"
-    )
-    if not res.success and res.error_message:
-        print("         err: " + res.error_message.strip().splitlines()[-1][:120])
-    return ok
+def _ceiling_1d(S: int, D: int, W: int, nbytes: int) -> float:
+    """Memory-roofline TFLOPS ceiling for 1D NATTEN with ideal K/V reuse."""
+    pairs = sum(min(S - 1, i + W) - max(0, i - W) + 1 for i in range(S))
+    flops = 4.0 * pairs * D  # per (b,h)
+    membytes = 4.0 * S * D * nbytes  # Q,K,V,O once each (ideal reuse)
+    ai = flops / membytes
+    return ai * PEAK_BW_GBPS / 1000.0
+
+
+def _bench(ex: SyclExecutor, kernel: str, args: dict):
+    res = ex.execute_raw(kernel_path=kernel, output_name="n", args=args, timeout=300)
+    return res
 
 
 def _correctness(ex: SyclExecutor, quick: bool, dim: str) -> bool:
@@ -52,30 +55,40 @@ def _correctness(ex: SyclExecutor, quick: bool, dim: str) -> bool:
         if not quick:
             shapes += [(2, 8, 512, 64, 8), (1, 8, 1024, 128, 16)]
         for B, H, S, D, W in shapes:
-            allok &= _run_one(
-                ex,
-                _KERNEL_1D,
-                "natten1d",
-                {
-                    "batch": B,
-                    "heads": H,
-                    "seq": S,
-                    "dim": D,
-                    "window": W,
-                    "iterations": 5,
-                    "warmup": 2,
-                    "verify": 1,
-                },
-            )
+            for kern, tag in ((_K1D, "1d-naive"), (_K1D_OPT, "1d-opt")):
+                r = _bench(
+                    ex,
+                    kern,
+                    {
+                        "batch": B,
+                        "heads": H,
+                        "seq": S,
+                        "dim": D,
+                        "window": W,
+                        "qtile": 8,
+                        "kvtile": 32,
+                        "dtype": "bf16",
+                        "iterations": 5,
+                        "warmup": 2,
+                        "verify": 1,
+                    },
+                )
+                ok = bool(r.success and r.output_correct is not False)
+                allok &= ok
+                print(
+                    f"  [{'PASS' if ok else 'FAIL'}] {tag:<9} "
+                    f"B{B}H{H}S{S}D{D}w{W} correct={r.output_correct}"
+                )
+                if not r.success and r.error_message:
+                    print("         err: " + r.error_message.strip().splitlines()[-1][:120])
     if dim in ("2d", "both"):
         shapes = [(1, 2, 16, 16, 32, 3, 3), (1, 4, 24, 24, 64, 5, 5)]
         if not quick:
             shapes += [(1, 4, 32, 32, 64, 7, 7), (1, 8, 48, 48, 128, 3, 3)]
         for B, H, HI, WI, D, KH, KW in shapes:
-            allok &= _run_one(
+            r = _bench(
                 ex,
-                _KERNEL_2D,
-                "natten2d",
+                _K2D,
                 {
                     "batch": B,
                     "heads": H,
@@ -89,55 +102,43 @@ def _correctness(ex: SyclExecutor, quick: bool, dim: str) -> bool:
                     "verify": 1,
                 },
             )
+            ok = bool(r.success and r.output_correct is not False)
+            allok &= ok
+            print(
+                f"  [{'PASS' if ok else 'FAIL'}] 2d-naive  "
+                f"B{B}H{H}{HI}x{WI}D{D}{KH}x{KW} correct={r.output_correct}"
+            )
+            if not r.success and r.error_message:
+                print("         err: " + r.error_message.strip().splitlines()[-1][:120])
     return allok
 
 
 def _benchmark(ex: SyclExecutor, quick: bool, dim: str) -> None:
-    print("\n=== Benchmark (verify=0, 30 iters) ===")
-    if dim in ("1d", "both"):
-        print("  1D neighborhood attention [B,H,S,D], window w:")
-        rows = [(2, 8, 1024, 64, 8), (2, 8, 2048, 64, 8)]
-        if not quick:
-            rows += [(4, 16, 4096, 64, 8), (2, 8, 2048, 128, 16)]
-        for B, H, S, D, W in rows:
-            _run_one(
-                ex,
-                _KERNEL_1D,
-                "natten1d",
-                {
-                    "batch": B,
-                    "heads": H,
-                    "seq": S,
-                    "dim": D,
-                    "window": W,
-                    "iterations": 30,
-                    "warmup": 5,
-                    "verify": 0,
-                },
-            )
-    if dim in ("2d", "both"):
-        print("  2D neighborhood attention [B,H,Hi,Wi,D], window kh x kw:")
-        rows = [(1, 8, 64, 64, 64, 7, 7)]
-        if not quick:
-            rows += [(1, 8, 96, 96, 64, 7, 7), (2, 8, 64, 64, 128, 5, 5)]
-        for B, H, HI, WI, D, KH, KW in rows:
-            _run_one(
-                ex,
-                _KERNEL_2D,
-                "natten2d",
-                {
-                    "batch": B,
-                    "heads": H,
-                    "himg": HI,
-                    "wimg": WI,
-                    "dim": D,
-                    "kh": KH,
-                    "kw": KW,
-                    "iterations": 30,
-                    "warmup": 5,
-                    "verify": 0,
-                },
-            )
+    if dim not in ("1d", "both"):
+        return
+    print("\n=== 1D benchmark: naive vs optimized (bf16), % of memory roofline ===")
+    print("  shape                 naive    opt    ceiling   opt%roof")
+    rows = [(2, 8, 2048, 64, 8), (4, 16, 4096, 64, 8)]
+    if not quick:
+        rows += [(2, 8, 2048, 128, 16), (4, 16, 4096, 128, 32)]
+    for B, H, S, D, W in rows:
+        base = {
+            "batch": B,
+            "heads": H,
+            "seq": S,
+            "dim": D,
+            "window": W,
+            "iterations": 30,
+            "warmup": 5,
+            "verify": 0,
+        }
+        rn = _bench(ex, _K1D, base)  # naive (fp32)
+        ro = _bench(ex, _K1D_OPT, {**base, "qtile": 16, "kvtile": 64, "dtype": "bf16"})
+        ceil = _ceiling_1d(S, D, W, nbytes=2)  # bf16 ceiling
+        n = rn.tflops or 0.0
+        o = ro.tflops or 0.0
+        pct = 100.0 * o / ceil if ceil else 0.0
+        print(f"  B{B}H{H}S{S}D{D}w{W:<3}  {n:6.3f}  {o:6.3f}  {ceil:7.2f}   {pct:5.1f}%")
 
 
 def main() -> int:
