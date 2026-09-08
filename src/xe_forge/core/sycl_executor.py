@@ -53,6 +53,7 @@ _DEVICE_NAME_TO_TARGET: dict[str, str] = {
 class KernelType(Enum):
     GEMM = "gemm"
     FA = "fa"
+    NATTEN = "natten"
     DUAL_GEMM = "dual_gemm"
     GROUPED_GEMM = "grouped_gemm"
     MOE_GEMM = "moe_gemm"
@@ -83,9 +84,9 @@ def _include_dirs(sycl_tla_dir: str, kernel_type: KernelType = KernelType.GEMM) 
         f"{sycl_tla_dir}/tools/util/include",
         f"{sycl_tla_dir}/examples/common",
     ]
-    if kernel_type in (KernelType.FA, KernelType.DUAL_GEMM):
+    if kernel_type in (KernelType.FA, KernelType.NATTEN, KernelType.DUAL_GEMM):
         dirs.append(f"{sycl_tla_dir}/applications")
-    if kernel_type == KernelType.FA:
+    if kernel_type in (KernelType.FA, KernelType.NATTEN):
         dirs.append(f"{sycl_tla_dir}/examples/06_bmg_flash_attention")
         dirs.append(f"{sycl_tla_dir}/benchmarks/flash_attention")
     if kernel_type == KernelType.MOE_GEMM:

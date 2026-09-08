@@ -40,7 +40,11 @@ Xe-Forge 侧:`examples/natten/natten1d_fmha.cpp` 用 `FMHAConfigGenWithTileShape
   band-tile 的有用比例越高。
 - 但 **DPAS 也封顶在 ~10–12% roof**,没有逼近理论上限。
 
-## 4. 为什么 DPAS 也只到 ~11%(定论)
+## 4. 为什么 DPAS 也只到 ~11%(未调优时)
+
+> 注:下表 DPAS 数字用的是**未调优**的 `WgTileQ=256`。经 §7 的 tile-tune 调优后
+> 可到 **7.35 TFLOPS(37% roof)**。本节解释的是"为什么默认配置低效"。
+
 
 1. **稠密矩形 vs 薄带的错配**:FMHA 对一个 Q-tile 算的是 `[BLQ × (BLQ+2w)]` 的**稠密矩形**,
    而 NATTEN 只需要 `2w+1` 的**对角带**。有效比例 ≈ `(2w+1)/(BLQ+2w)`。w=8、BLQ=256 时仅 ~6%,
@@ -66,8 +70,44 @@ cd /home/lm/sycl-tla && git apply /home/lm/Xe-Forge/examples/natten/sycl-tla-nat
 uv run python runners/test_natten_sycl.py            # 含 SIMT vs DPAS vs % roof
 ```
 
-## 6. 交付物
+## 6. Tier-2:接入 tile-tune 搜索(把 DPAS NATTEN 变成可自动调优)
+
+把 NATTEN 接成 Xe-Forge 的 tile-tune 策略(`--tune-config` 的 `mode: natten`),让 LLM 搜索
+FMHA tile 配置。因为 NATTEN 复用 FMHA,**直接复用 FA 的 config 空间与 `validate_fa_tile`**,
+只加一个 workload 级 `window` 参数:
+
+- `KernelType.NATTEN`(include 目录同 FA);`templates/natten.cpp.j2` + `generate_natten_source`
+  (在 `KernelArguments` 末尾传 `window`);`NATTENStrategy`(继承 `FAStrategy`,重写
+  source-gen / run-args / 硬件提示 / seed);CLI `mode: natten` 映射;`tune_natten.yaml`。
+
+**关键调优点**:默认 FA seed 是 `WgTileQ=256`(对薄带很差)。给 `NATTENStrategy` 换了
+**小 Q-tile seed(`qk_m=32, sg_q=16` → SgTileQ=2)** 和明确的硬件提示("薄带要用小 `qk_m` +
+大 `sg_q`"),3 轮搜索稳定收敛到最优:
+
+| 方案 | 配置 | TFLOPS | % memory roof |
+|------|------|-------:|--------------:|
+| naive | — | 0.08 | 0.4% |
+| SIMT-opt | D-split+SLM | 0.69 | 3.5% |
+| DPAS 未调优 | WgTileQ=256 | 2.29 | 11.6% |
+| **DPAS + tile-tune** | **WgTileQ=32, SgTileQ=2** | **7.35** | **37.3%** |
+
+即 tile-tune 把 DPAS NATTEN 从 11.6% 提到 **37% roof**(再 ~3.2x),验证了"搜索 FMHA tile
+配置"这条路能显著改善薄带 NATTEN。搜索测了 11 个 config,最优 `qk_m=32, sg_q=16, pv_k=32`。
+
+复现:`uv run python -m xe_forge.cli --dsl sycl --tune-config examples/tile_search/tune_natten.yaml`
+(需先按 §5 打 sycl-tla 补丁)。
+
+## 7. 交付物
 
 - `examples/natten/sycl-tla-natten.patch` —— sycl-tla FMHA 的带状掩码补丁(可 `git apply`)。
 - `examples/natten/natten1d_fmha.cpp` —— 用打补丁的 FMHA 跑 1D NATTEN(DPAS)。
+- `src/xe_forge/core/tile_search/templates/natten.cpp.j2` + `natten.py` —— NATTEN tile-tune 模板。
+- `src/xe_forge/core/tile_search/agent.py:NATTENStrategy` —— tile-tune 策略(复用 FA config)。
+- `examples/tile_search/tune_natten.yaml` —— NATTEN 调优配置。
 - `runners/test_natten_sycl.py` —— naive / SIMT-opt / DPAS 三方对比 + % roofline。
+
+## 8. 结论(修正版)
+
+- DPAS(FMHA fork)+ tile-tune 调优 → **7.35 TFLOPS,37% memory roof**,较未调优 DPAS 再 3.2x、
+  较 SIMT 10.7x、较 naive ~90x。
+- 仍未到 60–80% roof:受限于稠密矩形 vs 薄带的架构错配(§4)。再往上需**对角带专用 kernel**。

@@ -4,6 +4,7 @@ from xe_forge.core.tile_search.agent import (
     GroupedGEMMStrategy,
     KernelStrategy,
     MoEGEMMStrategy,
+    NATTENStrategy,
     TileTuningAgent,
     export_results_json,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "GroupedGEMMStrategy",
     "KernelStrategy",
     "MoEGEMMStrategy",
+    "NATTENStrategy",
     "TileTuningAgent",
     "TuneConfig",
     "export_results_json",

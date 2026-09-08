@@ -1,0 +1,16 @@
+mode: natten
+dtype: bf16
+fa_mode: prefill
+max_rounds: 3
+output: outputs/natten_tune.json
+
+tune-xpu:
+  - name: "NATTEN 1D B4H16 S4096 D128 w32"
+    dims:
+      head_dim: 128
+      batch: 4
+      num_heads_q: 16
+      num_heads_kv: 16
+      seq_qo: 4096
+      seq_kv: 4096
+      window: 32

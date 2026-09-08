@@ -21,6 +21,7 @@ from xe_forge.core.tile_search.templates import (
     generate_gemm_source,
     generate_grouped_gemm_source,
     generate_moe_gemm_source,
+    generate_natten_source,
 )
 from xe_forge.core.tile_search.validators import (
     KNOWN_FA_CONFIGS,
@@ -576,6 +577,102 @@ class FAStrategy:
             "pv_k": seed.pv_k,
             "sg_q": seed.sg_q,
             "pipeline_stages": seed.pipeline_stages,
+            "head_dim": head_dim,
+        }
+
+
+# ---------------------------------------------------------------------------
+# NATTENStrategy
+# ---------------------------------------------------------------------------
+
+
+class NATTENStrategy(FAStrategy):
+    """Tile tuning for NATTEN (neighborhood attention) via the patched sycl-tla FMHA.
+
+    Reuses the FA tile-config space, validator, and seed configs (NATTEN is FA
+    with a band mask); the half-window is a workload parameter carried on cfg.
+    """
+
+    def __init__(self, mode: str = "prefill"):
+        super().__init__(causal=False, mode=mode, persistent=False)
+
+    def build_problem_str(self, workload: dict) -> str:
+        return (
+            f"NATTEN (neighborhood attention) head_dim={workload.get('head_dim', 128)}, "
+            f"batch={workload.get('batch', 1)}, "
+            f"num_heads_q={workload.get('num_heads_q', 32)}, "
+            f"num_heads_kv={workload.get('num_heads_kv', 8)}, "
+            f"seq_qo={workload.get('seq_qo', 4096)}, "
+            f"seq_kv={workload.get('seq_kv', 4096)}, "
+            f"window={workload.get('window', 8)}, mode={self.mode}"
+        )
+
+    def build_hardware_info(self, dtype: str) -> str:
+        return (
+            "Intel Xe (BMG). FMHA DPAS kernel with a band mask (NATTEN). "
+            "Same tile constraints as FA: qk_n%16==0, sg_q divides qk_m, sg_q<=32, "
+            "qk_k in {16,32,64}. NATTEN-specific (IMPORTANT): the kernel tiles a dense "
+            "[qk_m x (qk_m+2*window)] rectangle but only the 2*window+1 diagonal band is "
+            "useful, so qk_m MUST be SMALL relative to the window (qk_m in {32,64}), and "
+            "sg_q should be LARGE so that SgTileQ=qk_m/sg_q is 2-4 (many subgroups split "
+            "the Q-tile for parallelism). E.g. for window=32: (qk_m=32, sg_q=16) or "
+            "(qk_m=64, sg_q=16..32) are good; AVOID qk_m>=128 (wastes the off-band "
+            f"rectangle). dtype={dtype}."
+        )
+
+    def enrich_config(self, cfg: dict, workload: dict) -> dict:
+        cfg = super().enrich_config(cfg, workload)  # adds head_dim
+        if "window" not in cfg:
+            cfg["window"] = workload.get("window", 8)
+        return cfg
+
+    def generate_source(self, cfg: dict, dtype: str) -> str:
+        head_dim = cfg.get("head_dim", 128)
+        return generate_natten_source(
+            wg_tile_q=cfg["qk_m"],
+            wg_tile_k=cfg["qk_n"],
+            wg_tile_v=cfg["pv_n"],
+            sg_tile_q=cfg["qk_m"] // cfg["sg_q"],
+            sg_tile_k=cfg["pv_k"],
+            head_dim_qk=cfg["qk_k"],
+            head_dim_v=head_dim,
+            window=cfg.get("window", 8),
+            dtype=dtype,
+            mode=self.mode,
+        )
+
+    def build_run_args(self, cfg: dict, workload: dict) -> dict[str, Any]:
+        hd = workload.get("head_dim", 128)
+        return {
+            "batch": workload.get("batch", 1),
+            "num_heads_q": workload.get("num_heads_q", 32),
+            "num_heads_kv": workload.get("num_heads_kv", 8),
+            "seq_len_qo": workload.get("seq_qo", 4096),
+            "seq_len_kv": workload.get("seq_kv", 4096),
+            "head_size_qk": workload.get("head_size_qk", hd),
+            "head_size_vo": workload.get("head_size_vo", hd),
+            "window": workload.get("window", cfg.get("window", 8)),
+            "iterations": 50,
+            "verify": 0,
+        }
+
+    def output_name(self, cfg: dict) -> str:
+        return (
+            f"natten_qk{cfg['qk_m']}x{cfg['qk_n']}x{cfg['qk_k']}"
+            f"_pv{cfg['pv_n']}x{cfg['pv_k']}_sg{cfg['sg_q']}_w{cfg.get('window', 8)}"
+        )
+
+    def get_seed_config(self, workload: dict) -> dict | None:
+        # NATTEN thin bands want a small Q-tile with many subgroups, not the FA seed.
+        head_dim = workload.get("head_dim", 128)
+        return {
+            "qk_m": 32,
+            "qk_n": 32,
+            "qk_k": 32,
+            "pv_n": 32,
+            "pv_k": 32,
+            "sg_q": 16,
+            "pipeline_stages": 2,
             "head_dim": head_dim,
         }
 

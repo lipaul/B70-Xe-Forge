@@ -339,6 +339,7 @@ def _run_tune_config(args, config: Config) -> int:
         GEMMStrategy,
         GroupedGEMMStrategy,
         MoEGEMMStrategy,
+        NATTENStrategy,
         TileTuningAgent,
         export_results_json,
         load_tune_config,
@@ -366,12 +367,14 @@ def _run_tune_config(args, config: Config) -> int:
 
     mode_to_kernel_type = {
         "fa": KernelType.FA,
+        "natten": KernelType.NATTEN,
         "gemm": KernelType.GEMM,
         "grouped_gemm": KernelType.GROUPED_GEMM,
         "moe": KernelType.MOE_GEMM,
     }
     mode_to_strategy = {
         "fa": FAStrategy,
+        "natten": NATTENStrategy,
         "gemm": GEMMStrategy,
         "grouped_gemm": GroupedGEMMStrategy,
         "moe": MoEGEMMStrategy,
@@ -380,6 +383,8 @@ def _run_tune_config(args, config: Config) -> int:
     executor = SyclExecutor(kernel_type=kernel_type, verify=False)
     if cfg.mode == "fa":
         strategy = FAStrategy(causal=cfg.causal, mode=cfg.fa_mode, persistent=cfg.persistent)
+    elif cfg.mode == "natten":
+        strategy = NATTENStrategy(mode=cfg.fa_mode)
     else:
         strategy = mode_to_strategy.get(cfg.mode, GEMMStrategy)()
 
