@@ -1,0 +1,101 @@
+diff --git a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+index a1b04bb..9d09ff4 100644
+--- a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
++++ b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+@@ -337,6 +337,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
+              int              l_coord,
+              int              full_tile_offset,
+              int              discard_seq_coord,
++             int              natten_window = 0,
+              TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
+              TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
+              float            scale_k = 1.0f,
+@@ -719,6 +720,25 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
+           }
+         }
+       }
++      /* Neighborhood (band) masking - non-cache, when natten_window>0.
++         K is the global K-tile index (main loop starts at blk_k0). */
++      if constexpr (!is_cache) {
++        if (natten_window > 0) {
++          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
++          Tensor gP = local_tile(cPgP, take<0,2>(TileShapeQK{}),
++                                 make_coord(get<0>(blk_qv), K));
++          auto cS_thread = thr_mma_qk.partition_C(gP);
++          CUTLASS_PRAGMA_UNROLL
++          for (int i = 0; i < tSrS.size(); ++i) {
++            int row_idx = get<0>(cS_thread(i));
++            int col_idx = get<1>(cS_thread(i));
++            int diff = col_idx - row_idx;
++            if (diff > natten_window || diff < -natten_window) {
++              tSrS(i) = ElementS(-INFINITY);
++            }
++          }
++        }
++      }
+       /* k masking for remainder tiles (cache and new) */
+       {
+         int seq_len_new = seq_len - seq_len_kv_cache;
+diff --git a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
+index 0b75466..140f3c1 100644
+--- a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
++++ b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
+@@ -146,6 +146,7 @@ public:
+     StrideK dK_cache{};
+     const ElementV *V_cache;
+     StrideV dV_cache{};
++    int natten_window = 0;  // >0: neighborhood attention, half-window w
+   };
+   using KernelParams = KernelArguments;
+ 
+@@ -257,6 +258,26 @@ public:
+         k_blocks = static_cast<int>(static_cast<unsigned>(seq_len) / static_cast<unsigned>(get<1>(TileShapeQK{})));
+       }
+ 
++      // Neighborhood attention: restrict the K-tile loop to the band covering
++      // this Q-tile's windows [q0-w, q0+BLK_Q-1+w]. Falls back to full range
++      // when natten_window==0 (plain attention / FA path unchanged).
++      int blk_k0 = 0, blk_k1 = k_blocks, total_blk = k_blocks;
++      const int natten_window = p.natten_window;
++      if (natten_window > 0) {
++        const int BLQ = get<0>(TileShapeQK{});
++        const int BLK = get<1>(TileShapeQK{});
++        const int q0 = blk_q * BLQ;
++        int lo = q0 - natten_window;
++        if (lo < 0) lo = 0;
++        const int hi = q0 + BLQ + natten_window;  // exclusive upper key bound
++        blk_k0 = lo / BLK;
++        blk_k1 = (hi + BLK - 1) / BLK;
++        const int total_tiles = (seq_len + BLK - 1) / BLK;
++        if (blk_k1 > total_tiles) blk_k1 = total_tiles;
++        if (blk_k0 > blk_k1) blk_k0 = blk_k1;
++        total_blk = blk_k1;
++      }
++
+       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+       int offset_k_cache = 0, offset_v_cache = 0;
+       int batch_dim = s.batch;
+@@ -361,9 +382,9 @@ public:
+                  K(_,_,head,l_coord),
+                  V(_,_,head,l_coord),
+                  tArA, tA_max, tA_sum,
+-                 blk_qv, 0, k_blocks, k_blocks,
++                 blk_qv, blk_k0, blk_k1, total_blk,
+                  thr_id, seq_len, 0, l_coord,
+-                 full_tile_offset, discard_seq_coord,
++                 full_tile_offset, discard_seq_coord, natten_window,
+                  K_cache(_,_,head,l_coord),
+                  V_cache(_,_,head,l_coord),
+                  p.scale_k, p.scale_v, p.scale_q,
+@@ -375,9 +396,9 @@ public:
+                  K(_,_,head,l_coord),
+                  V(_,_,head,l_coord),
+                  tArA, tA_max, tA_sum,
+-                 blk_qv, 0, k_blocks, k_blocks,
++                 blk_qv, blk_k0, blk_k1, total_blk,
+                  thr_id, seq_len, seq_len_kv_cache, idx_b,
+-                 full_tile_offset, discard_seq_coord,
++                 full_tile_offset, discard_seq_coord, natten_window,
+                  K_cache(_,_,head,l_coord),
+                  V_cache(_,_,head,l_coord),
+                  p.scale_k, p.scale_v, p.scale_q);

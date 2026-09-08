@@ -27,7 +27,8 @@ from xe_forge.core.sycl_executor import KernelType, SyclExecutor
 _here = Path(__file__).resolve().parent
 _NATTEN_DIR = _here.parent / "examples" / "natten"
 _K1D = str(_NATTEN_DIR / "natten1d_sycl.cpp")  # naive
-_K1D_OPT = str(_NATTEN_DIR / "natten1d_opt.cpp")  # D-split + SLM
+_K1D_OPT = str(_NATTEN_DIR / "natten1d_opt.cpp")  # D-split + SLM (SIMT)
+_K1D_DPAS = str(_NATTEN_DIR / "natten1d_fmha.cpp")  # DPAS via patched sycl-tla FMHA
 _K2D = str(_NATTEN_DIR / "natten2d_sycl.cpp")
 
 PEAK_BW_GBPS = 608.0  # Arc Pro B70 (matches scripts/roofline.py preset)
@@ -141,6 +142,57 @@ def _benchmark(ex: SyclExecutor, quick: bool, dim: str) -> None:
         print(f"  B{B}H{H}S{S}D{D}w{W:<3}  {n:6.3f}  {o:6.3f}  {ceil:7.2f}   {pct:5.1f}%")
 
 
+def _benchmark_dpas(ex: SyclExecutor, quick: bool, dim: str) -> None:
+    if dim not in ("1d", "both"):
+        return
+    ex_fa = SyclExecutor(kernel_type=KernelType.FA, verify=True)  # needs FMHA includes
+    print("\n=== 1D DPAS (patched sycl-tla FMHA, band mask) vs SIMT-opt, % of roof ===")
+    print("  shape                 SIMT    DPAS   ceiling  DPAS%roof")
+    rows = [(4, 16, 4096, 128, 8), (4, 16, 4096, 128, 32)]
+    if not quick:
+        rows += [(4, 16, 4096, 128, 64)]
+    for B, H, S, D, W in rows:
+        simt = _bench(
+            ex,
+            _K1D_OPT,
+            {
+                "batch": B,
+                "heads": H,
+                "seq": S,
+                "dim": D,
+                "window": W,
+                "qtile": 16,
+                "kvtile": 64,
+                "dtype": "bf16",
+                "iterations": 30,
+                "warmup": 5,
+                "verify": 0,
+            },
+        )
+        dpas = _bench(
+            ex_fa,
+            _K1D_DPAS,
+            {
+                "batch": B,
+                "num_heads_q": H,
+                "num_heads_kv": H,
+                "seq_len_qo": S,
+                "seq_len_kv": S,
+                "head_size_qk": D,
+                "head_size_vo": D,
+                "window": W,
+                "iterations": 30,
+                "warmup": 10,
+                "verify": 0,
+            },
+        )
+        ceil = _ceiling_1d(S, D, W, nbytes=2)
+        sv = simt.tflops or 0.0
+        dv = dpas.tflops or 0.0
+        pct = 100.0 * dv / ceil if ceil else 0.0
+        print(f"  B{B}H{H}S{S}D{D}w{W:<3}  {sv:5.3f}  {dv:5.3f}  {ceil:6.2f}   {pct:5.1f}%")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run Intel SYCL NATTEN kernels on XPU")
     ap.add_argument("--quick", action="store_true", help="smaller shapes only")
@@ -155,6 +207,7 @@ def main() -> int:
     ex = SyclExecutor(kernel_type=KernelType.GEMM, verify=True)
     allok = _correctness(ex, args.quick, args.dim)
     _benchmark(ex, args.quick, args.dim)
+    _benchmark_dpas(ex, args.quick, args.dim)
     print("\n=== RESULT:", "ALL PASS" if allok else "SOME FAILED", "===")
     return 0 if allok else 2
 
