@@ -101,13 +101,49 @@ FMHA tile 配置。因为 NATTEN 复用 FMHA,**直接复用 FA 的 config 空间
 
 - `examples/natten/sycl-tla-natten.patch` —— sycl-tla FMHA 的带状掩码补丁(可 `git apply`)。
 - `examples/natten/natten1d_fmha.cpp` —— 用打补丁的 FMHA 跑 1D NATTEN(DPAS)。
+- `examples/natten/natten2d_opt.cpp` —— 2D NATTEN 的 SIMT 优化版(D-split + SLM)。
 - `src/xe_forge/core/tile_search/templates/natten.cpp.j2` + `natten.py` —— NATTEN tile-tune 模板。
 - `src/xe_forge/core/tile_search/agent.py:NATTENStrategy` —— tile-tune 策略(复用 FA config)。
 - `examples/tile_search/tune_natten.yaml` —— NATTEN 调优配置。
 - `runners/test_natten_sycl.py` —— naive / SIMT-opt / DPAS 三方对比 + % roofline。
 
-## 8. 结论(修正版)
+## 8. 2D NATTEN 优化版(`natten2d_opt.cpp`)
 
-- DPAS(FMHA fork)+ tile-tune 调优 → **7.35 TFLOPS,37% memory roof**,较未调优 DPAS 再 3.2x、
-  较 SIMT 10.7x、较 naive ~90x。
+把 1D 的 SIMT 优化(D-split 子组 + SLM 分块 + 在线 softmax + 带状掩码)搬到 2D:work-group
+处理一行里的 `TQ` 个 query(同 `r`、`c∈[c0,c0+TQ)`),它们的邻域块(行 `[r-rh,r+rh]`、列
+`[c0-rw,c0+TQ-1+rw]`)流式进 SLM 复用;因为是行条,行方向天然在窗内,掩码只需判 `|cc-c|<=rw`。
+一个坑:内层每 key 做 `ki/bc`、`ki%bc` 的整数除/模很贵,改成 SLM 载入时预存每 key 的列号 `kcol`。
+
+2D 结果(bf16,`runners/test_natten_sycl.py`):
+
+| shape | naive | opt | 加速 | ceiling | opt%roof |
+|-------|------:|----:|-----:|--------:|---------:|
+| B2H8 64×64 D64 7×7 | 0.131 | 0.292 | 2.2x | 14.1 | 2.1% |
+| B2H8 64×64 D128 5×5 | 0.081 | 0.355 | 4.4x | 7.3 | 4.9% |
+| B4H8 128×128 D64 3×3 | 0.096 | 0.200 | 2.1x | 2.7 | 7.4% |
+
+正确性全过。**2D 提升有限(2–4x)且 % roof 更低**:2D 窗口更小(9–49 keys),每 query 工作量
+极小,`reduce_over_group`/barrier 的固定开销占比更高 → 比 1D 更严重地 overhead-bound。
+
+## 9. fp8 对比(负结果,印证 issue-bound)
+
+DPAS FMHA 原生支持 fp8(config-gen 元素类型),用同一调优 tile(`qk_m=32, sg_q=16`)对比:
+
+| window | DPAS-bf16 | DPAS-fp8 | bf16 ceiling |
+|-------:|----------:|---------:|-------------:|
+| w=8 | 1.93 | 1.54 | 5.16 |
+| w=32 | 7.36 | 5.96 | 19.68 |
+| w=64 | 10.23 | 7.45 | 38.91 |
+
+**fp8 反而慢 ~20%**。fp8 把字节减半 → memory 天花板翻倍,但**达成吞吐不升反降**,因为 kernel
+根本不是 bandwidth-bound(而是 issue/overhead-bound),fp8 只增加了反量化/转换开销。这正好
+实证了前述结论:**降精度只在真正 memory-bound 时才有收益**。注:fp8 数值正确性需 block-scale
+接线(未做),此处仅比吞吐。
+
+## 10. 结论(修正版)
+
+- **1D DPAS + tile-tune** → w=32 时 **7.36 TFLOPS(37% roof)**;窗口越大越高(w=64 达 10.2 TF)。
+  较未调优 DPAS 再 ~3x、较 SIMT ~10x、较 naive ~90x。
+- **2D SIMT 优化** → 2–4x,但薄 2D 窗 overhead-bound,% roof 仅 2–7%。
+- **fp8** → 负结果(慢 ~20%),印证 issue-bound。
 - 仍未到 60–80% roof:受限于稠密矩形 vs 薄带的架构错配(§4)。再往上需**对角带专用 kernel**。
