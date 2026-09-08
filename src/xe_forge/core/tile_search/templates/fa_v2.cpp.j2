@@ -22,7 +22,7 @@ using FAConfig = FMHAConfigGenWithTileShape<
     <% element_type %>, <% element_type %>, <% element_type %>, float,
     cutlass::layout::RowMajor, cutlass::layout::ColumnMajor,
     cutlass::layout::RowMajor, cutlass::layout::RowMajor,
-    <% causal %>, false, false, false, <% persistent %>,
+    float, <% causal %>, false, false, false, <% persistent %>, false,
     <% wg_tile_q %>, <% wg_tile_k %>, <% wg_tile_v %>,
     <% sg_tile_q %>, <% sg_tile_k %>,
     <% head_dim_qk %>, <% head_dim_v %>
@@ -287,6 +287,10 @@ int main(int argc, const char** argv) {
     typename FMHAKernel::Arguments arguments{
         {shape, block_Q.get(), stride_Q, block_K.get(), stride_K,
          block_V.get(), stride_V, block_O.get(), stride_O,
+         <%% if persistent != "true" %%>
+         nullptr, {}, nullptr, {}, nullptr, {},
+         1.f, 1.f, 1.f, 32,
+         <%% endif %%>
          block_K_cache.get(), stride_K_cache,
          block_V_cache.get(), stride_V_cache},
         {softmax_scale, nullptr, 0, nullptr},

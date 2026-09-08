@@ -1,0 +1,17 @@
+mode: fa
+dtype: bf16
+fa_mode: prefill
+causal: false
+persistent: false
+max_rounds: 3
+output: outputs/fa2_llama3.json
+
+tune-xpu:
+  - name: "Llama 3 8B prefill seq=4096"
+    dims:
+      head_dim: 128
+      batch: 1
+      num_heads_q: 32
+      num_heads_kv: 8
+      seq_qo: 4096
+      seq_kv: 4096
