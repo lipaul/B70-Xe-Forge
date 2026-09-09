@@ -1,33 +1,54 @@
 diff --git a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
-index a1b04bb..9d09ff4 100644
+index a1b04bb..e4667de 100644
 --- a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
 +++ b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
-@@ -337,6 +337,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
+@@ -337,6 +337,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
               int              l_coord,
               int              full_tile_offset,
               int              discard_seq_coord,
 +             int              natten_window = 0,
++             int              natten_T = 0,
++             int              natten_H = 0,
++             int              natten_W = 0,
++             int              natten_kt = 0,
++             int              natten_kh = 0,
++             int              natten_kw = 0,
               TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
               TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
               float            scale_k = 1.0f,
-@@ -719,6 +720,25 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
+@@ -719,6 +726,40 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
            }
          }
        }
-+      /* Neighborhood (band) masking - non-cache, when natten_window>0.
-+         K is the global K-tile index (main loop starts at blk_k0). */
++      /* Neighborhood masking - non-cache: 3D box (natten_kt>0) or 1D band.
++         K is the global K-tile index (main loop starts at blk_k0). row=query, col=key. */
 +      if constexpr (!is_cache) {
-+        if (natten_window > 0) {
++        if (natten_kt > 0 || natten_window > 0) {
 +          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
 +          Tensor gP = local_tile(cPgP, take<0,2>(TileShapeQK{}),
 +                                 make_coord(get<0>(blk_qv), K));
 +          auto cS_thread = thr_mma_qk.partition_C(gP);
++          const int nHW = natten_H * natten_W;
++          const int hhw = (natten_kt - 1) / 2, hhf = (natten_kh - 1) / 2, hwf = (natten_kw - 1) / 2;
 +          CUTLASS_PRAGMA_UNROLL
 +          for (int i = 0; i < tSrS.size(); ++i) {
 +            int row_idx = get<0>(cS_thread(i));
 +            int col_idx = get<1>(cS_thread(i));
-+            int diff = col_idx - row_idx;
-+            if (diff > natten_window || diff < -natten_window) {
++            bool keep;
++            if (natten_kt > 0) {  // 3D box, NATTEN shift-clamp (window stays kernel-wide)
++              int rt = row_idx / nHW, rh = (row_idx / natten_W) % natten_H, rw = row_idx % natten_W;
++              int ct = col_idx / nHW, ch = (col_idx / natten_W) % natten_H, cw = col_idx % natten_W;
++              int st = rt - hhw; st = st < 0 ? 0 : (st > natten_T - natten_kt ? natten_T - natten_kt : st);
++              int sh = rh - hhf; sh = sh < 0 ? 0 : (sh > natten_H - natten_kh ? natten_H - natten_kh : sh);
++              int sw = rw - hwf; sw = sw < 0 ? 0 : (sw > natten_W - natten_kw ? natten_W - natten_kw : sw);
++              keep = (ct >= st && ct < st + natten_kt) &&
++                     (ch >= sh && ch < sh + natten_kh) &&
++                     (cw >= sw && cw < sw + natten_kw);
++            } else {  // 1D band on flat index
++              int diff = col_idx - row_idx;
++              keep = !(diff > natten_window || diff < -natten_window);
++            }
++            if (!keep) {
 +              tSrS(i) = ElementS(-INFINITY);
 +            }
 +          }
@@ -37,33 +58,46 @@ index a1b04bb..9d09ff4 100644
        {
          int seq_len_new = seq_len - seq_len_kv_cache;
 diff --git a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
-index 0b75466..140f3c1 100644
+index 0b75466..b62005d 100644
 --- a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
 +++ b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
-@@ -146,6 +146,7 @@ public:
+@@ -146,6 +146,14 @@ public:
      StrideK dK_cache{};
      const ElementV *V_cache;
      StrideV dV_cache{};
 +    int natten_window = 0;  // >0: neighborhood attention, half-window w
++    // 3D-box NA (natten_kt>0 enables): volume (T,H,W) + box (kt,kh,kw).
++    int natten_T = 0;
++    int natten_H = 0;
++    int natten_W = 0;
++    int natten_kt = 0;
++    int natten_kh = 0;
++    int natten_kw = 0;
    };
    using KernelParams = KernelArguments;
  
-@@ -257,6 +258,26 @@ public:
+@@ -257,6 +265,32 @@ public:
          k_blocks = static_cast<int>(static_cast<unsigned>(seq_len) / static_cast<unsigned>(get<1>(TileShapeQK{})));
        }
  
-+      // Neighborhood attention: restrict the K-tile loop to the band covering
-+      // this Q-tile's windows [q0-w, q0+BLK_Q-1+w]. Falls back to full range
-+      // when natten_window==0 (plain attention / FA path unchanged).
++      // Neighborhood attention: restrict the K-tile loop to the range covering
++      // this Q-tile's windows. Falls back to full range when disabled.
++      // 3D-box mode (natten_kt>0): the box's flat-index superset half-width is
++      // (kt-1)*H*W + (kh-1)*W + (kw-1); use it as the 1D range, and the mainloop
++      // applies the exact shift-clamp box mask on the (row,col) flat coords.
 +      int blk_k0 = 0, blk_k1 = k_blocks, total_blk = k_blocks;
 +      const int natten_window = p.natten_window;
-+      if (natten_window > 0) {
++      const int nT = p.natten_T, nH = p.natten_H, nW = p.natten_W;
++      const int nkt = p.natten_kt, nkh = p.natten_kh, nkw = p.natten_kw;
++      int range_w = (nkt > 0) ? ((nkt - 1) * nH * nW + (nkh - 1) * nW + (nkw - 1))
++                              : natten_window;
++      if (range_w > 0) {
 +        const int BLQ = get<0>(TileShapeQK{});
 +        const int BLK = get<1>(TileShapeQK{});
 +        const int q0 = blk_q * BLQ;
-+        int lo = q0 - natten_window;
++        int lo = q0 - range_w;
 +        if (lo < 0) lo = 0;
-+        const int hi = q0 + BLQ + natten_window;  // exclusive upper key bound
++        const int hi = q0 + BLQ + range_w;  // exclusive upper key bound
 +        blk_k0 = lo / BLK;
 +        blk_k1 = (hi + BLK - 1) / BLK;
 +        const int total_tiles = (seq_len + BLK - 1) / BLK;
@@ -75,7 +109,7 @@ index 0b75466..140f3c1 100644
        int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
        int offset_k_cache = 0, offset_v_cache = 0;
        int batch_dim = s.batch;
-@@ -361,9 +382,9 @@ public:
+@@ -361,9 +395,9 @@ public:
                   K(_,_,head,l_coord),
                   V(_,_,head,l_coord),
                   tArA, tA_max, tA_sum,
@@ -83,11 +117,11 @@ index 0b75466..140f3c1 100644
 +                 blk_qv, blk_k0, blk_k1, total_blk,
                   thr_id, seq_len, 0, l_coord,
 -                 full_tile_offset, discard_seq_coord,
-+                 full_tile_offset, discard_seq_coord, natten_window,
++                 full_tile_offset, discard_seq_coord, natten_window, nT, nH, nW, nkt, nkh, nkw,
                   K_cache(_,_,head,l_coord),
                   V_cache(_,_,head,l_coord),
                   p.scale_k, p.scale_v, p.scale_q,
-@@ -375,9 +396,9 @@ public:
+@@ -375,9 +409,9 @@ public:
                   K(_,_,head,l_coord),
                   V(_,_,head,l_coord),
                   tArA, tA_max, tA_sum,
@@ -95,7 +129,7 @@ index 0b75466..140f3c1 100644
 +                 blk_qv, blk_k0, blk_k1, total_blk,
                   thr_id, seq_len, seq_len_kv_cache, idx_b,
 -                 full_tile_offset, discard_seq_coord,
-+                 full_tile_offset, discard_seq_coord, natten_window,
++                 full_tile_offset, discard_seq_coord, natten_window, nT, nH, nW, nkt, nkh, nkw,
                   K_cache(_,_,head,l_coord),
                   V_cache(_,_,head,l_coord),
                   p.scale_k, p.scale_v, p.scale_q);
